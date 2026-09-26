@@ -1,0 +1,26 @@
+datasets
+# Numerical RSI runtime (previously used but undeclared).
+numpy
+# Legacy API backends only; retained until dependency cleanup.
+anthropic
+anthropic[bedrock]
+backoff
+botocore
+boto3
+openai
+# Shared runtime resumes here.
+pathspec
+
+# SWE-Bench
+beautifulsoup4
+chardet
+docker
+ghapi
+GitPython
+pre-commit
+python-dotenv
+rich
+unidiff
+
+# Configuration
+PyYAML

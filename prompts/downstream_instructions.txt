@@ -1,0 +1,5 @@
+Read the relevant implementation and nearby tests before editing.
+Identify the underlying cause and make a focused production-code fix.
+Check edge cases suggested by the issue and preserve existing interfaces.
+Run a small relevant test when its dependencies are already available.
+Explain the change and any tests that could not be run.
