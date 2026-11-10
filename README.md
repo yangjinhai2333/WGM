@@ -4,14 +4,6 @@ WGM is a self-improving coding-agent search method that combines lineage-level
 exploration with best-arm identification (BAI). This repository also includes
 the HGM and DGM baselines.
 
-## Agent backends
-
-- **Codex CLI** (default): uses `codex exec`.
-- **Claude Code CLI** (optional): set `codex.provider: claude_code` in your
-  configuration. See [CLAUDE_BACKEND.md](CLAUDE_BACKEND.md) for details.
-
-Both CLI backends use account login. Each run uses a single backend throughout.
-
 ## Setup
 
 Use Python 3.10, Docker, and an installed, logged-in agent CLI.
