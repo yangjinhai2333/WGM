@@ -1,4 +1,4 @@
-"""V2 canonical SearchState: independent RNGs, IID observations and fixed lineages."""
+"""WGM canonical SearchState (Algorithm 1): independent RNGs, IID observations, agent EXP3, BAI."""
 from copy import deepcopy
 from dataclasses import asdict
 import random
@@ -6,7 +6,7 @@ import random
 import evaluation_ledger as io
 from search_state import SearchState
 from wgm_v2_config import identity, runtime_control
-from wgm_v2_selector import LineageEXP3, bai, interval, restore_rng, rng_snapshot, seed_for
+from wgm_v2_selector import AgentEXP3, bai, interval, restore_rng, rng_snapshot, seed_for
 
 
 class WGMV2State(SearchState):
@@ -43,11 +43,25 @@ class WGMV2State(SearchState):
                 raise ValueError('V2_OBSERVATION_INVALID')
             rows.append({'candidate_id': node.commit_id, 'node_id': node.id,
                          'lineage_id': self.branches[node.id], 'admission_index': self.admission[node.commit_id],
-                         **interval(self.admission[node.commit_id], len(values), sum(values), self.config.wgm_v2.delta)})
+                         **interval(len(values), sum(values), self.config.wgm_v2.z)})
         return rows
 
-    def choose_bai(self, lineage):
-        return bai(self.rows(lineage), self.config.wgm_v2.epsilon)
+    def clade_rho(self):
+        """Smoothed clade success rate (Eqs. 5-6) from every own observation in each clade."""
+        success = {n.id: sum(n.utility_measures) for n in self.nodes.values()}
+        total = {n.id: len(n.utility_measures) for n in self.nodes.values()}
+        clade_s, clade_n = dict(success), dict(total)
+        for node in self.nodes.values():
+            parent = node.parent_id
+            while parent is not None:
+                clade_s[parent] += success[node.id]
+                clade_n[parent] += total[node.id]
+                parent = self.nodes[parent].parent_id
+        return {n.commit_id: (clade_s[n.id]+1)/(clade_n[n.id]+2) for n in self.nodes.values()}
+
+    def choose_bai(self, tie_key):
+        """BAISTEP over the whole current archive."""
+        return bai(self.rows(), [self.config.search.seed, tie_key])
 
     def reserve(self, run_id, expansion_id, domain, number):
         ids = []
@@ -70,18 +84,23 @@ class WGMV2State(SearchState):
             for sid in current['batch_slots']:
                 self.slots[sid]['status'] = 'released_invalid'
             if not initial:
+                # A non-executable child receives zero reward; the iteration's BAISTEP still runs.
                 self.selector.feedback(row['expansion_id'], 0)
-                if len(self.execution['observations']) == current['start_count']:
+                if current['bai_limit'] == 0 and len(self.execution['observations']) == current['start_count']:
                     self.zero_progress_expansions += 1
-            self.round = None
+            self.round = None if initial or current['bai_limit'] == 0 else {**current, 'phase': 'bai'}
         else:
             if child.commit_id != row['candidate_id'] or child.commit_id in self.admission:
                 raise ValueError('V2_ADMISSION_IDENTITY')
-            branch = len(self.founders) if initial else self.branches[child.parent_id]
+            # Definition 1: each child of the initial agent founds its own lineage.
+            root = child.parent_id is not None and self.nodes[child.parent_id].parent_id is None
+            branch = len(self.founders) if root else self.branches[child.parent_id]
             self.branches[child.id] = branch
-            if initial:
+            if root:
                 self.founders[branch] = child.commit_id
             self.admission[child.commit_id] = len(self.admission)+1
+            if self.selector is not None:
+                self.selector.add(child.commit_id)  # w_b = 1 on admission.
             row.update(status='admitted', child_id=child.id)
             current.update(phase='batch', child_id=child.id)
             for sid in current['batch_slots']:
@@ -90,10 +109,12 @@ class WGMV2State(SearchState):
         self.inflight = None
 
     def freeze(self):
-        self.selector = LineageEXP3(self.founders, self.config.wgm_v2, self.selection_rng)
+        # After initialization every archived agent receives weight one (Appendix C).
+        agents = sorted(self.admission, key=self.admission.get)
+        self.selector = AgentEXP3(agents, self.config.wgm_v2, self.selection_rng)
         self.initialized = True
-        self.initialized_identity = {'schema_version': 1, 'effective_C': len(self.founders),
-            'eta': self.selector.eta, 'founders': {str(k): v for k, v in self.founders.items()},
+        self.initialized_identity = {'schema_version': 2, 'initial_archive_size': len(agents),
+            'founders': {str(k): v for k, v in self.founders.items()},
             'intent_digest': io.digest(self.identity())}
 
     def observe_binding(self, result):
@@ -126,26 +147,30 @@ class WGMV2State(SearchState):
         context['observations'][eid] = value
         slot.update(status='completed', observation=value, binding_digest=result.binding_digest)
         self.inflight = None
-        if slot['domain'] == 'local_bai':
-            self.round['local_completed'] += 1
+        if slot['domain'] == 'bai':
+            self.round['bai_completed'] += 1
+            if self.round['bai_completed'] >= self.round['bai_limit']:
+                self.round = None
         else:
             batch = [self.slots[x] for x in self.round['batch_slots']]
             if all(x['status'] == 'completed' for x in batch):
-                if not self.round['initial']:
+                if self.round['initial']:
+                    self.round = None
+                else:
                     self.selector.feedback(self.round['expansion_id'], sum(x['observation'] for x in batch)/len(batch))
-                self.round = None
+                    self.round = None if self.round['bai_limit'] == 0 else {**self.round, 'phase': 'bai'}
         return True
 
     def summary(self):
         completed = [s for s in self.slots.values() if s['status'] == 'completed']
         return {'experiment': self.identity(), 'initial_attempts': self.initial_attempts,
-            'initialization_complete': self.initialized, 'effective_C': len(self.founders) if self.initialized else None,
+            'initialization_complete': self.initialized, 'lineages': len(self.founders) if self.initialized else None,
             'valid_search_evaluations': len(completed), 'task_draws': len(self.draws),
             'unique_tasks': len({d['task_id'] for d in self.draws}),
             'repeat_draws': len(self.draws)-len({d['task_id'] for d in self.draws}),
             'reserved': sum(s['status'] in ('reserved', 'sampled') for s in self.slots.values()),
             'completed_by_domain': {d: sum(s['domain'] == d for s in completed)
-                                    for d in ('initialization', 'local_bai', 'child_batch')},
+                                    for d in ('initialization', 'bai', 'child_batch')},
             'invalid_expansions': sum(r['status'] == 'failed' for r in self.history),
             'zero_progress_expansions': self.zero_progress_expansions,
             'stop_reason': self.stop_reason, 'D_design': None,
@@ -175,7 +200,7 @@ class WGMV2State(SearchState):
                 or state['tasks'] != self.tasks):
             raise ValueError('V2_STATE_IDENTITY')
         selection, task = restore_rng(state['v2_rng']['selection']), restore_rng(state['v2_rng']['task'])
-        selector = LineageEXP3.restore(state['selector'], self.config.wgm_v2) if state['selector'] else None
+        selector = AgentEXP3.restore(state['selector'], self.config.wgm_v2) if state['selector'] else None
         if selector and rng_snapshot(selector.rng) != rng_snapshot(selection):
             raise ValueError('V2_SELECTOR_RNG_MISMATCH')
         rows = state['nodes']
@@ -218,14 +243,14 @@ class WGMV2State(SearchState):
             rows = self.rows(c)
             if not rows:
                 continue
-            top = bai(rows, self.config.wgm_v2.epsilon)['leader']
+            top = bai(rows, [self.config.search.seed, f'top-lineage-{c}'])['leader']
             node, chain = self.nodes[top['node_id']], []
             while node is not None:
                 chain.append(node.commit_id)
                 node = self.nodes.get(node.parent_id)
             ranked.append({**top, 'parent_chain': list(reversed(chain)),
                            'selection_basis': 'maximum_search_lower_bound',
-                           'tie_break': 'candidate_utf8_bytes', 'certificate': None})
+                           'tie_break': 'uniform_random_keyed_v1', 'certificate': None})
         ranked.sort(key=lambda r: (-r['lower'], r['lineage_id']))
         return {'schema_version': 1, 'primary': ranked[0] if ranked else None,
                 'secondary': ranked[1] if len(ranked) > 1 else None,

@@ -216,11 +216,12 @@ def final_report(directory, budget, *, entries=None):
             check(len(state['records']) <= result['completed'], 'BAI_FINAL_STATE_CHANGED')
     cp.unchanged()
     return _seal_report({**result, **source, 'algorithm': 'wgm_v2', 'profile': 'wgm_v2', 'role': 'bai_final',
-        'checkpoint': budget, 'valid_search_budget': budget, 'canonical_budget': budget,
+        # B_fin is reserved inside B: search used n <= B - B_fin, final BAI the rest.
+        'checkpoint': budget, 'valid_search_budget': cp.state['n_task_evals'], 'canonical_budget': cp.state['n_task_evals'],
         'checkpoint_digest': cp.digest, 'candidate_id': selected['candidate_id'], 'selection': selected,
         'selection_digest': digest(manifest['v2_derived']), 'final_selection_source': 'checkpoint_bai',
         'final_selection_rule': RULE, 'bai_selection_digest': bai['selection_digest'],
-        'extra_bai_evaluations': bai['completed'], 'total_selection_evaluations': budget + bai['completed'],
+        'extra_bai_evaluations': bai['completed'], 'total_selection_evaluations': cp.state['n_task_evals'] + bai['completed'],
         'checkpoint_bai_calls': {k: bai[k] for k in ('physical_model_calls', 'physical_evaluator_calls')},
         'checkpoint_bai_wall_seconds': bai['wall_seconds'], 'common_root': root,
         'task_membership_hash': root['task_membership_hash'], 'task_order_hash': root['task_order_hash'],
@@ -240,8 +241,8 @@ def report_bundle(directory, budget):
         'checkpoint_bai_budget': bai['budget'], 'checkpoint_bai_selected_candidate': (
             bai['selection']['candidate_id'] if bai['selection'] else None),
         'checkpoint_bai_selection_digest': bai['selection_digest'], 'checkpoint_bai_final': final,
-        'canonical_budget': budget, 'extra_bai_evaluations': bai['completed'],
-        'total_selection_evaluations': budget + bai['completed'], 'checkpoint_bai': bai}
+        'canonical_budget': cp.state['n_task_evals'], 'extra_bai_evaluations': bai['completed'],
+        'total_selection_evaluations': cp.state['n_task_evals'] + bai['completed'], 'checkpoint_bai': bai}
 
 
 def run(directory, budget, mode, *, workers=None, preflight, retry_preparation=None, readiness=None):

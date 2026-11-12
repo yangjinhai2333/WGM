@@ -14,7 +14,8 @@ from search_operation_journal import durable_record
 from search_operations import SearchOperations, read_checkpoint
 from search_state import save_checkpoint
 from validated_search import ValidatedSearch
-from wgm_v2_config import CHECKPOINTS, SPEC, pause_target, runtime_control, resolve_initial_source
+from wgm_v2_config import (CHECKPOINTS, SPEC, final_budget, pause_target, runtime_control,
+                           resolve_initial_source, search_budget)
 from wgm_v2_state import WGMV2State
 
 
@@ -59,7 +60,8 @@ class WGMV2Search(ValidatedSearch):
         check(target >= old, 'V2_TARGET_DECREASE')
         if target != old:
             check(old in CHECKPOINTS and target in CHECKPOINTS and
-                  CHECKPOINTS.index(target) == CHECKPOINTS.index(old)+1 and self.count == old,
+                  CHECKPOINTS.index(target) == CHECKPOINTS.index(old)+1
+                  and (self.run.directory / 'checkpoints' / f'{old:06d}.json').exists(),
                   'V2_CONTINUE_REQUIRES_COMPLETED_PREVIOUS_TARGET')
             control['continuations'].append({'from': old, 'to': target, 'valid_observations': self.count,
                 'canonical_checkpoint_digest': read_checkpoint(self.run.directory)['sha256']})
@@ -84,32 +86,31 @@ class WGMV2Search(ValidatedSearch):
             durable_record(path, value)
 
     def milestone(self):
-        if self.count not in CHECKPOINTS:
+        """Snapshot total budget b where its search stage ends: the first iteration boundary at
+        which a full iteration no longer fits in b - B_fin(b). Final BAI then spends B_fin(b)."""
+        state, cfg = self.state, self.config.wgm_v2
+        if not state.initialized or state.round is not None or state.inflight is not None:
             return
-        # No adaptive action occurs between result consumption and this snapshot.
-        saved = read_checkpoint(self.run.directory)
+        step = cfg.M + cfg.bai_evals_per_iteration
         folder = self.run.directory / 'checkpoints'
-        folder.mkdir(exist_ok=True)
-        path = folder / f'{self.count:06d}.json'
-        row = {'schema_version': 1, 'domain': 'canonical', 'b': self.count,
-               'run_fingerprint': self.fingerprint, 'state_digest': saved['sha256'],
-               'state': saved['state'], 'runtime_control': saved['runtime_control'],
-               'search_wall_time_seconds': recorded_wall_time(self.operations.recorder)}
-        if path.exists():
-            previous = io._read_json(path)
-            check(previous['state_digest'] == row['state_digest'] and previous['state'] == row['state'],
-                  'V2_CHECKPOINT_CONFLICT')
-        else:
+        for b in CHECKPOINTS:
+            limit = search_budget(cfg, b)
+            path = folder / f'{b:06d}.json'
+            if not self.count <= limit < self.count + step or path.exists():
+                continue
+            saved = read_checkpoint(self.run.directory)
+            check(saved['state']['n_task_evals'] == self.count, 'V2_CHECKPOINT_STALE')
+            folder.mkdir(exist_ok=True)
+            row = {'schema_version': 1, 'domain': 'canonical', 'b': b,
+                   'run_fingerprint': self.fingerprint, 'state_digest': saved['sha256'],
+                   'state': saved['state'], 'runtime_control': saved['runtime_control'],
+                   'search_wall_time_seconds': recorded_wall_time(self.operations.recorder)}
             durable_record(path, row)
-        selection = {**self.state.top_lineages(), 'canonical_checkpoint_digest': saved['sha256'],
-                     'valid_search_evaluations': self.count,
-                     'derived_bai_budget': math.floor(self.config.wgm_v2.checkpoint_bai_fraction*self.count),
-                     'derived_bai_status': 'not_executed'}
-        selection_path = folder / f'{self.count:06d}.selection.json'
-        if selection_path.exists():
-            check(io.same_json(io._read_json(selection_path), selection), 'V2_SELECTION_CONFLICT')
-        else:
-            durable_record(selection_path, selection)
+            selection = {**self.state.top_lineages(), 'canonical_checkpoint_digest': saved['sha256'],
+                         'valid_search_evaluations': self.count,
+                         'derived_bai_budget': final_budget(cfg, b),
+                         'derived_bai_status': 'not_executed'}
+            durable_record(folder / f'{b:06d}.selection.json', selection)
 
     def reconcile(self):
         self._validate_consumption()
@@ -129,10 +130,6 @@ class WGMV2Search(ValidatedSearch):
         state, cfg = self.state, self.config.wgm_v2
         initial = not state.initialized
         eid = f'expansion-{len(state.history):06d}'
-        available = cfg.planning_horizon-self.count
-        if available < cfg.M:
-            self.transaction(lambda: setattr(state, 'stop_reason', 'insufficient_full_batch_budget'))
-            return
         if not initial and state.zero_progress_expansions >= cfg.safety_attempt_cap:
             self.transaction(lambda: setattr(state, 'stop_reason', 'zero_progress_expansion_cap'))
             return
@@ -142,11 +139,14 @@ class WGMV2Search(ValidatedSearch):
         def create():
             slots = state.reserve(self.run.manifest['run_id'], eid,
                                   'initialization' if initial else 'child_batch', cfg.M)
-            selected = None if initial else state.selector.select(eid)
+            # Eq. 8: a_t ~ pi_t over the whole archive, from weights and clade statistics.
+            selected = None if initial else state.selector.select(eid, state.clade_rho())
+            parent = 0 if initial else next(n.id for n in state.nodes.values()
+                                            if n.commit_id == selected['candidate_id'])
             state.round = {'expansion_id': eid, 'initial': initial, 'batch_slots': slots,
-                'selected': selected, 'start_count': self.count, 'local_limit': 0 if initial else min(cfg.local_bai_evals, available-cfg.M),
-                'local_completed': 0, 'phase': 'generation' if initial else 'local',
-                'parent_id': 0 if initial else None, 'parent_draw': None, 'child_id': None}
+                'selected': selected, 'start_count': self.count,
+                'bai_limit': 0 if initial else cfg.bai_evals_per_iteration, 'bai_completed': 0,
+                'phase': 'generation', 'parent_id': parent, 'child_id': None}
         self.transaction(create)
 
     def _select_expansion(self):
@@ -164,22 +164,11 @@ class WGMV2Search(ValidatedSearch):
         state.inflight = {'kind': 'expansion', 'expansion_id': current['expansion_id']}
         return parent, cid
 
-    def _local_or_parent(self):
-        state, current, cfg = self.state, self.state.round, self.config.wgm_v2
-        branch = current['selected']['lineage_id']
-        choice = state.choose_bai(branch)
-        if current['local_completed'] < current['local_limit'] and choice['evaluate'] is not None:
-            candidate = state.nodes[choice['evaluate']['node_id']]
-            # Child slots were reserved first; task draws follow actual execution order.
-            self._evaluate(candidate, domain='local_bai')
-            return
-        def parent():
-            draw = state.selection_rng.random()  # consumed even when leader == founder
-            cid = state.founders[branch] if draw < cfg.rho_r else choice['leader']['candidate_id']
-            node = next(n for n in state.nodes.values() if n.commit_id == cid)
-            current.update(parent_draw=draw, parent_id=node.id, phase='generation',
-                           local_stop_reason=choice['stop_reason'] or 'budget_exhausted')
-        self.transaction(parent)
+    def _bai_step(self):
+        """BAISTEP(A_{t+1}): one additional evaluation of the leader or its challenger."""
+        state, current = self.state, self.state.round
+        choice = state.choose_bai(f"{current['expansion_id']}/{current['bai_completed']}")
+        self._evaluate(state.nodes[choice['evaluate']['node_id']], domain='bai')
 
     def _evaluate(self, node, *, domain, slot_id=None):
         state = self.state
@@ -228,35 +217,51 @@ class WGMV2Search(ValidatedSearch):
 
     def run_to_budget(self):
         self.reconcile()
-        target = self.state.runtime_control['target_budget']
-        while self.count < target and self.state.stop_reason is None:
+        cfg = self.config.wgm_v2
+        limit = search_budget(cfg, self.state.runtime_control['target_budget'])
+        step = cfg.M + cfg.bai_evals_per_iteration
+        while self.state.stop_reason is None:
             state = self.state
-            if not state.initialized and state.round is None and state.initial_attempts == self.config.wgm_v2.initial_expansion_target:
-                self.transaction(state.freeze)
-                self._initialized_manifest()
-                continue
             if state.round is None:
+                self.milestone()
+                if not state.initialized:
+                    if state.initial_attempts == cfg.initial_expansion_target:
+                        self.transaction(state.freeze)
+                        self._initialized_manifest()
+                        continue
+                    if self.count >= limit:
+                        break
+                elif self.count + step > limit:
+                    break  # A full iteration no longer fits outside the reserved B_fin.
                 self._new_round()
                 continue
             phase = state.round['phase']
-            if phase == 'local':
-                self._local_or_parent()
-            elif phase == 'generation':
+            if phase == 'generation':
                 self._expand()  # Existing N2 plan -> gate -> marker -> terminal -> admission.
             elif phase == 'batch':
                 sid = next(s for s in state.round['batch_slots'] if state.slots[s]['status'] == 'reserved')
                 self._evaluate(state.nodes[state.round['child_id']], domain=state.slots[sid]['domain'], slot_id=sid)
+            elif phase == 'bai':
+                self._bai_step()
             else:
                 raise ValueError('V2_ROUND_PHASE')
         self.milestone()
         return self.count
+
+    def search_complete(self):
+        """The search stage for the current target ended at an iteration boundary."""
+        cfg, state = self.config.wgm_v2, self.state
+        limit = search_budget(cfg, state.runtime_control['target_budget'])
+        return state.round is None and (state.stop_reason is not None or state.initialized
+            and self.count + cfg.M + cfg.bai_evals_per_iteration > limit
+            or not state.initialized and self.count >= limit)
 
     def write_outputs(self, error=None):
         stats = physical_accounting(self.run, self.operations)
         self.state.runtime_control['accounting'] = stats
         self.save()
         summary = {**self.state.summary(), **stats, 'runtime_control': deepcopy(self.state.runtime_control),
-            'status': 'incomplete' if error or self.count < self.state.runtime_control['target_budget'] else 'paused',
+            'status': 'incomplete' if error or not self.search_complete() else 'paused',
             'error_code': error, 'planning_horizon': 800,
             'formal_comparison_eligible': self.run.manifest['experiment']['requested_execution_policy'] == 'validated'
                 and self.state.runtime_control['protocol'] == 'formal',
@@ -400,7 +405,7 @@ def run_search(config, *, preflight):
         check(saved['wgm_v2_runtime']['protocol'] == config.protocol.effective_name, 'V2_PROTOCOL_CHANGED')
         old, new = saved['wgm_v2_runtime']['target_budget'], pause_target(config)
         check(new == old or old in CHECKPOINTS and new in CHECKPOINTS and CHECKPOINTS.index(new) == CHECKPOINTS.index(old)+1
-              and checkpoint['state']['n_task_evals'] == old, 'V2_CONTINUATION_TARGET')
+              and (Path(directory) / 'checkpoints' / f'{old:06d}.json').exists(), 'V2_CONTINUATION_TARGET')
     else:
         check(not Path(directory).exists(), 'RUN_DIRECTORY_EXISTS')
     preflight(config, output_root=directory)
@@ -436,7 +441,7 @@ def run_search(config, *, preflight):
             recorder.refresh('incomplete')
             raise
         engine.write_outputs()
-        recorder.refresh('completed' if engine.count == pause_target(config) else 'incomplete')
+        recorder.refresh('completed' if engine.search_complete() else 'incomplete')
     return run.directory
 
 

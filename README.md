@@ -1,8 +1,16 @@
-# WGM: Lineage-Level Exploration for Self-Improving Coding Agents
+# Wright–Gödel Machine (WGM): Mitigating Homogenization in Self-Improving Agents
 
-WGM is a self-improving coding-agent search method that combines lineage-level
-exploration with best-arm identification (BAI). This repository also includes
-the HGM and DGM baselines.
+WGM is an archive-based self-improving coding-agent search method. It selects
+parents with an EXP3-based rule that combines clade statistics with a uniform
+exploration floor, and uses best-arm identification (BAI) to allocate
+additional evaluations and select the final agent (Algorithm 1 of the paper).
+The implementation is in `wgm_v2_selector.py`, `wgm_v2_state.py` and
+`wgm_v2_search.py`; the final-selection stage is in `wgm_v2_derived.py`.
+Defaults (`wgm_v2_config.py`) follow Appendix C.1: gamma = 0.1, M = 3 search
+tasks per new child, one BAI evaluation per iteration, Wilson intervals with
+z = 1.96, and B_fin = floor(0.325 B) of the total budget B reserved for final
+selection (260 of 800). This repository also includes the HGM and DGM
+baselines.
 
 ## Setup
 

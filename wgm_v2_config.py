@@ -25,13 +25,12 @@ class WGMV2Config:
     checkpoints: tuple = CHECKPOINTS
     initial_expansion_target: int = 5
     gamma: float = 0.1
-    eta: float | None = None
-    M: int = 1
-    rho_r: float = 0.1
-    delta: float = 0.05
-    epsilon: float = 0.05
-    local_bai_evals: int = 1
-    checkpoint_bai_fraction: float = 0.2
+    M: int = 3
+    z: float = 1.96
+    bai_evals_per_iteration: int = 1
+    # Reserved final-selection share of each total budget B: B_fin = floor(fraction * B)
+    # (Appendix C.1: 260 of 800). Initialization and search share B - B_fin.
+    checkpoint_bai_fraction: float = 0.325
     task_seed: int = 42
     safety_attempt_cap: int = 800
 
@@ -51,24 +50,18 @@ class WGMV2Config:
         if not isinstance(self.checkpoints, (list, tuple)) or any(type(n) is not int for n in self.checkpoints) or tuple(self.checkpoints) not in (CHECKPOINTS, LEGACY_CHECKPOINTS):
             raise SearchConfigurationError('V2 checkpoints must match a supported exact schedule')
         object.__setattr__(self, 'checkpoints', tuple(self.checkpoints))
-        for name in ('initial_expansion_target', 'M', 'safety_attempt_cap', 'smoke_target_budget', 'local_bai_evals', 'task_seed'):
+        for name in ('initial_expansion_target', 'M', 'safety_attempt_cap', 'smoke_target_budget', 'bai_evals_per_iteration', 'task_seed'):
             value = getattr(self, name)
-            if type(value) is not int or value < (0 if name in ('local_bai_evals', 'task_seed') else 1):
+            if type(value) is not int or value < (0 if name in ('bai_evals_per_iteration', 'task_seed') else 1):
                 raise SearchConfigurationError('Invalid V2 integer: ' + name)
         if self.smoke_target_budget > 800 or self.task_seed >= 2**32 or self.M > 800 or self.initial_expansion_target * self.M > 800:
             raise SearchConfigurationError('V2 initialization/seed exceeds bounds')
-        for name in ('gamma', 'eta', 'rho_r', 'delta', 'epsilon', 'checkpoint_bai_fraction'):
+        for name in ('gamma', 'z', 'checkpoint_bai_fraction'):
             value = getattr(self, name)
-            if name == 'eta' and value is None:
-                continue
             if type(value) not in (float, int) or not math.isfinite(value):
                 raise SearchConfigurationError('Invalid V2 number: ' + name)
-            if name == 'eta':
-                good = value > 0
-            elif name == 'delta':
-                good = 0 < value < 1
-            else:
-                good = (0 < value <= 1) if name == 'gamma' else (0 <= value <= 1)
+            # gamma in (0, 1) (Section 3.3; 1 = uniform-only variant); z > 0; the reserved share leaves room for search.
+            good = {'gamma': 0 < value <= 1, 'z': value > 0, 'checkpoint_bai_fraction': 0 <= value < 1}[name]
             if not good:
                 raise SearchConfigurationError('Invalid V2 range: ' + name)
 
@@ -85,10 +78,11 @@ def identity(config):
             'implementation_schema': 2, 'budget_semantics': 'fixed_horizon_increasing_pause_v1',
             'parameters': config.wgm_v2.scientific(), 'seed': config.search.seed,
             'rng_schema': RNG_SCHEMA, 'python_version': platform.python_version(),
-            'interval': 'anytime_hoeffding_admission_index_v1',
-            'tie_break': 'candidate_utf8_bytes_then_lineage_integer',
+            'interval': 'wilson_score_v1', 'parent_selection': 'agent_exp3_clade_rho_v1',
+            'tie_break': 'uniform_random_keyed_v1',
             'sampling': 'uniform_with_replacement', 'admission': 'corrected_structure_v1',
             'reward': 'immediate_child_batch_or_trusted_invalid_zero',
+            'budget_split': 'search_budget_is_B_minus_floor_fraction_B_v1',
             'protocol': {'name': 'wgm_v2_canonical'},
             'requested_execution_policy': getattr(config, '_v2_requested_policy', config.execution.policy),
             'workers': 1, 'checkpoint_bai_execution': False, 'final_benchmark_execution': False,
@@ -138,3 +132,13 @@ def validate_initial_source(config, source):
         raise SearchConfigurationError('V2_INITIAL_POLICY_DIGEST_MISMATCH: frozen comparison policy changed')
     if config.wgm_v2.initial_source_sha256 is not None and source_snapshot(source)['sha256'] != config.wgm_v2.initial_source_sha256:
         raise SearchConfigurationError('V2_INITIAL_SOURCE_DIGEST_MISMATCH: frozen comparison source changed')
+
+
+def search_budget(config, b):
+    """Evaluations shared by initialization and adaptive search for total budget b."""
+    return b - final_budget(config, b)
+
+
+def final_budget(config, b):
+    """Reserved final-selection BAI budget B_fin for total budget b."""
+    return math.floor(config.checkpoint_bai_fraction * b)

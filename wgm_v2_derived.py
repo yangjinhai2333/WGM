@@ -26,7 +26,7 @@ def derived_seed(checkpoint_digest, b, task_seed):
 
 
 def snapshot_rows(state, counts=None):
-    delta = state['experiment']['parameters']['delta']
+    z = state['experiment']['parameters']['z']
     rows = []
     for node in state['nodes']:
         cid = node['commit_id']
@@ -35,7 +35,7 @@ def snapshot_rows(state, counts=None):
         rows.append({'candidate_id': cid, 'node_id': node['id'],
             'lineage_id': state['branches'][str(node['id'])],
             'admission_index': state['admission'][cid],
-            **interval(state['admission'][cid], n, s, delta)})
+            **interval(n, s, z)})
     return rows
 
 
@@ -43,15 +43,14 @@ def snapshot_selection(state):
     rows, ranked = snapshot_rows(state), []
     nodes = {r['id']: r for r in state['nodes']}
     for lineage in sorted(int(c) for c in state['founders']):
-        top = bai([r for r in rows if r['lineage_id'] == lineage],
-                  state['experiment']['parameters']['epsilon'])['leader']
+        top = bai([r for r in rows if r['lineage_id'] == lineage], [state['experiment']['seed'], f'top-lineage-{lineage}'])['leader']
         node, chain = nodes[top['node_id']], []
         while node is not None:
             chain.append(node['commit_id'])
             node = nodes.get(node['parent_id'])
         ranked.append({**top, 'parent_chain': list(reversed(chain)),
                        'selection_basis': 'maximum_search_lower_bound',
-                       'tie_break': 'candidate_utf8_bytes', 'certificate': None})
+                       'tie_break': 'uniform_random_keyed_v1', 'certificate': None})
     ranked.sort(key=lambda r: (-r['lower'], r['lineage_id']))
     return {'primary': ranked[0] if ranked else None, 'secondary': ranked[1] if len(ranked) > 1 else None,
             'secondary_reason': None if len(ranked) > 1 else 'fewer_than_two_eligible_lineages'}
@@ -69,7 +68,8 @@ class Checkpoint:
         self.digest = self.row['state_digest']
         check(self.row['schema_version'] == 1 and self.row['domain'] == 'canonical' and self.row['b'] == b
               and self.row['run_fingerprint'] == self.manifest['reproducibility_fingerprint']
-              and self.digest == digest(self.state) and self.state['n_task_evals'] == b
+              and self.digest == digest(self.state)
+              and self.state['n_task_evals'] <= b - math.floor(self.state['experiment']['parameters']['checkpoint_bai_fraction'] * b)
               and self.state['experiment'] == self.manifest['experiment']
               and self.state['experiment']['algorithm'] == 'wgm_v2', 'DERIVED_CHECKPOINT_IDENTITY')
         self.selection = snapshot_selection(self.state)
@@ -160,7 +160,6 @@ def make_manifest(checkpoint, config, domain, entries):
           'DERIVED_TASK_INPUT_CHANGED')
     row = deepcopy(checkpoint.manifest)
     params = checkpoint.state['experiment']['parameters']
-    check(domain != 'bai' or params['checkpoint_bai_fraction'] == .2, 'DERIVED_FORMAL_BAI_FRACTION_REQUIRED')
     row['v2_derived'] = {'schema_version': 1, 'domain': domain, 'checkpoint': checkpoint.b,
         'canonical_run_id': checkpoint.manifest['run_id'], 'canonical_run_fingerprint': checkpoint.manifest['reproducibility_fingerprint'],
         'canonical_checkpoint_digest': checkpoint.digest, 'selection': selected,
@@ -196,9 +195,11 @@ class DerivedEvaluation:
 
     def decision(self, state):
         if self.domain == 'bai':
+            # Final stage of Algorithm 1: BAISTEP on the frozen archive until B_fin is spent,
+            # then return argmax lower bound (the leader).
             choice = bai(snapshot_rows(self.checkpoint.state, state['counts']),
-                         self.checkpoint.state['experiment']['parameters']['epsilon'])
-            reason = choice['stop_reason'] or ('budget_exhausted' if len(state['records']) >= self.identity['budget'] else None)
+                         f"{self.identity['task_seed']}/{len(state['records'])}")
+            reason = 'budget_exhausted' if len(state['records']) >= self.identity['budget'] else None
             return choice, reason
         return None, 'final60_completed' if len(state['records']) == self.identity['budget'] else None
 
@@ -322,7 +323,7 @@ class DerivedEvaluation:
             'canonical_feedback': False, 'task_level_held_out': False, 'D_design': None}
         if self.domain == 'bai':
             result.update(selection=choice['leader'], challenger=choice['challenger'],
-                certificate='conditional_epsilon' if done and reason == 'epsilon_satisfied' else None,
+                certificate=None,
                 confidence_scope='one_IID_stationary_trajectory_not_joint_checkpoints',
                 draws=[{'task_id': r['plan']['identity']['task_id'], 'evaluation_id': r['plan']['identity']['evaluation_id'],
                         'candidate_id': r['plan']['identity']['candidate_id']} for r in state['records']])

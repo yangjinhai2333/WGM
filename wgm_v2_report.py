@@ -119,7 +119,7 @@ def read_search_report(directory, manifest):
         config=SimpleNamespace(wgm_v2=SimpleNamespace(**state['experiment']['parameters']))))
     check(coverage == saved['smoke_coverage'], 'REPORT_COVERAGE_CHANGED')
     coverage.update(initialization_attempts=state['initial_attempts'],
-                    local_bai_evaluations=saved['completed_by_domain']['local_bai'])
+                    bai_evaluations=saved['completed_by_domain']['bai'])
     selection = io._read_json(directory / 'wgm_v2_selection.json')
     check(selection['canonical_state_digest'] == checkpoint['sha256']
           and all(selection[k] == v for k, v in snapshot_selection(state).items()), 'REPORT_SELECTION_CHANGED')
@@ -131,7 +131,13 @@ def read_search_report(directory, manifest):
               'REPORT_RUNTIME_FINGERPRINT_CHANGED')
     pending = sum(r['decision'] != 'BOUND_CONSUMED' and r['outcome'] != 'failed' for r in rows)
     incomplete_operations = len(op_plans) - len(committed)
-    complete = (state['n_task_evals'] == control['target_budget'] and not state['inflight']
+    # The search stage of total budget B ends at the first iteration boundary where a full
+    # iteration (M child evaluations + BAI) no longer fits in B - B_fin (Algorithm 1).
+    params, n = state['experiment']['parameters'], state['n_task_evals']
+    limit = control['target_budget'] - math.floor(params['checkpoint_bai_fraction'] * control['target_budget'])
+    stopped = state['round'] is None and (state['stop_reason'] is not None or (
+        n + params['M'] + params['bai_evals_per_iteration'] > limit if state['initialized'] else n >= limit))
+    complete = (stopped and not state['inflight']
                 and not saved['error_code'] and not pending and not incomplete_operations)
     check(run_summary['status'] != 'completed' or complete, 'REPORT_COMPLETION_CHANGED')
     network_path = directory / 'network_readiness.json'
@@ -186,7 +192,7 @@ def search_report_text(report):
         f"Budget: planning_horizon={r['planning_horizon']}; target={r['target_budget']}; valid={r['valid_search_evaluations']}",
         f"Search observations: resolved={r['resolved']}; unresolved={r['unresolved']} (search events, not final60 accuracy)",
         f"Coverage: initialization_complete={str(coverage['initialization_complete']).lower()}; initialization_attempts={coverage['initialization_attempts']}; lineages={r['lineage_count']} (includes root)",
-        f"EXP3 selections={coverage['exp3_selections']}; BAI parent selections={coverage['bai_parent_selections']}; extra local BAI evaluations={coverage['local_bai_evaluations']}",
+        f"EXP3 selections={coverage['exp3_selections']}; parent selections={coverage['bai_parent_selections']}; BAI evaluations={coverage['bai_evaluations']}",
         f"N2 committed operations={coverage['operation_commits']}; validated bindings={coverage['validated_bindings']}; uncovered_reason={coverage['post_init_uncovered_reason']}",
         f"IID draws={r['task_draws']}; unique tasks={r['unique_tasks']}; repeats={r['repeat_draws']}",
         f"Calls: diagnosis={c['diagnosis_calls']}; generation={c['generation_calls']}; downstream={c['downstream_model_calls']}; evaluator={c['physical_evaluator_calls']}; total={c['total_physical_calls']} (process start confirmations)",

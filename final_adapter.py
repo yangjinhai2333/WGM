@@ -319,15 +319,17 @@ def search_accounting(cp):
     stats = accounting(cp.directory, evaluation_ids=eval_ids, operation_ids=op_ids)
     stats['downstream_model_calls'] = stats['physical_model_calls'] - stats['diagnosis_calls'] - stats['generation_calls']
     stats['evaluator_calls'] = stats['physical_evaluator_calls']
+    # WGM's search stage ends below b (B_fin is reserved inside b); others spend exactly b.
+    valid = state['n_task_evals'] if cp.manifest['experiment']['algorithm'] == 'wgm_v2' else cp.b
     wall = cp.row.get('search_wall_time_seconds')
     latest_path = cp.directory / 'search_state.json'
     if latest_path.exists() and wall is None:
         latest = io._read_json(latest_path)['state']
         count = latest.get('valid_evaluations', latest.get('n_task_evals'))
         summary = cp.directory / 'run_summary.json'
-        if count == cp.b and summary.exists():
+        if count == valid and summary.exists():
             wall = io._read_json(summary).get('timing', {}).get('whole_run_total', wall)
-    return {**stats, 'search_wall_seconds': wall, 'valid_search_evaluations': cp.b,
+    return {**stats, 'search_wall_seconds': wall, 'valid_search_evaluations': valid,
             'search_schedule_hash': cp.manifest['tasks']['task_order_hash'],
             'workers': cp.manifest.get('evaluation_parallelism')}
 

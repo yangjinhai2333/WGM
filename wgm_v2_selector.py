@@ -1,4 +1,5 @@
-"""Pure WGM V2 EXP3 and anytime Hoeffding BAI; no HGM/V1 statistics."""
+"""WGM parent selection and BAI as in Algorithm 1: agent-level EXP3 with clade statistics,
+Wilson-interval leader/challenger BAI."""
 from copy import deepcopy
 import hashlib
 import json
@@ -33,67 +34,87 @@ def restore_rng(row):
     return rng
 
 
-def interval(index, n, successes, delta):
-    if (type(index) is not int or index < 1 or type(n) is not int or n < 0
-            or type(successes) is not int or not 0 <= successes <= n
-            or type(delta) not in (float, int) or not 0 < delta < 1):
+def interval(n, successes, z):
+    """Wilson score interval (Appendix C, Eq. C.1); [0, 1] for an unevaluated agent."""
+    if (type(n) is not int or n < 0 or type(successes) is not int or not 0 <= successes <= n
+            or type(z) not in (float, int) or not math.isfinite(z) or z <= 0):
         raise ValueError('V2_BAI_COUNTS')
     if n == 0:
         return {'n': 0, 'successes': 0, 'mean': None, 'lower': 0.0, 'upper': 1.0}
-    radius = math.sqrt((math.log(2 * math.pi**4 / (36 * delta))
-                        + 2 * math.log(index) + 2 * math.log(n)) / (2*n))
     mean = successes / n
+    centre = mean + z*z/(2*n)
+    radius = z*math.sqrt(mean*(1-mean)/n + z*z/(4*n*n))
+    scale = 1 + z*z/n
     return {'n': n, 'successes': successes, 'mean': mean,
-            'lower': max(0.0, mean-radius), 'upper': min(1.0, mean+radius)}
+            'lower': max(0.0, (centre-radius)/scale), 'upper': min(1.0, (centre+radius)/scale)}
 
 
-def bai(rows, epsilon):
-    """Rows carry candidate_id and their own interval. All outputs are copies."""
+def _argmax(rows, value, tie_key):
+    """Maximum of value(row); ties are broken uniformly at random by a pure keyed draw."""
+    best = max(value(r) for r in rows)
+    tied = sorted((r for r in rows if value(r) == best), key=lambda r: r['candidate_id'].encode('utf-8'))
+    if len(tied) == 1:
+        return tied[0]
+    return tied[random.Random(seed_for('bai-tie', [tie_key, value.__name__])).randrange(len(tied))]
+
+
+def bai(rows, tie_key):
+    """One BAISTEP decision (Eqs. 11-12): leader h = argmax lower, challenger k = argmax upper
+    over A minus h, evaluate the wider interval of {h, k}; h when |A| = 1. No early stopping."""
     if not rows:
         raise ValueError('V2_NO_ELIGIBLE_AGENT')
-    key = lambda r: r['candidate_id'].encode('utf-8')
-    leader = min(rows, key=lambda r: (-r['lower'], key(r)))
+    def lower(r): return r['lower']
+    def upper(r): return r['upper']
+    def width(r): return r['upper'] - r['lower']
+    leader = _argmax(rows, lower, tie_key)
     others = [r for r in rows if r['candidate_id'] != leader['candidate_id']]
-    challenger = min(others, key=lambda r: (-r['upper'], key(r))) if others else None
-    reason = 'single_candidate' if challenger is None else (
-        'epsilon_satisfied' if challenger['upper']-leader['lower'] <= epsilon else None)
-    choice = None if reason else min([leader, challenger], key=lambda r: (
-        -(r['upper']-r['lower']), r['n'], key(r)))
-    return deepcopy({'leader': leader, 'challenger': challenger, 'evaluate': choice, 'stop_reason': reason})
+    challenger = _argmax(others, upper, tie_key) if others else None
+    choice = leader if challenger is None else _argmax([leader, challenger], width, tie_key)
+    return deepcopy({'leader': leader, 'challenger': challenger, 'evaluate': choice, 'stop_reason': None})
 
 
-class LineageEXP3:
-    def __init__(self, founders, config, rng):
-        self.founders = dict(sorted((int(k), v) for k, v in founders.items()))
-        if list(self.founders) != list(range(len(self.founders))) or len(self.founders) < 2:
-            raise ValueError('V2_LINEAGES_REQUIRE_TWO')
+class AgentEXP3:
+    """EXP3 parent selection over all archived agents (Eqs. 6-8, 10).
+
+    pi_a = (1-gamma) w_a rho_a / sum_u w_u rho_u + gamma/N_t, eta_t = gamma/N_t, and only the
+    selected parent receives w <- w exp(eta_t r / pi_a). New agents enter with weight one."""
+    def __init__(self, agents, config, rng):
         self.config, self.rng = config, rng
-        self.eta = config.eta if config.eta is not None else config.gamma / len(self.founders)
-        if config.gamma / len(self.founders) <= 0:
-            raise ValueError('V2_EXPLORATION_UNDERFLOW')
-        self.log_weights = {c: 0.0 for c in self.founders}
-        self.selections = {c: 0 for c in self.founders}
-        self.feedback_counts = {c: 0 for c in self.founders}
+        self.log_weights = {}
+        self.selections, self.feedback_counts = {}, {}
         self.draws, self.rewards = {}, {}
+        for agent in agents:
+            self.add(agent)
 
-    def probabilities(self):
+    def add(self, agent):
+        if type(agent) is not str or agent in self.log_weights:
+            raise ValueError('V2_AGENT_IDENTITY')
+        self.log_weights[agent] = 0.0
+        self.selections[agent] = 0
+        self.feedback_counts[agent] = 0
+
+    def probabilities(self, rho):
+        if set(rho) != set(self.log_weights) or not rho:
+            raise ValueError('V2_CLADE_STATISTICS')
+        gamma, n = self.config.gamma, len(self.log_weights)
         largest = max(self.log_weights.values())
-        weights = {c: math.exp(w-largest) for c, w in self.log_weights.items()}
-        total = math.fsum(weights.values())
-        return {c: (1-self.config.gamma)*weights[c]/total + self.config.gamma/len(weights) for c in weights}
+        scores = {a: math.exp(w-largest) * rho[a] for a, w in self.log_weights.items()}
+        total = math.fsum(scores.values())
+        # min() only absorbs float rounding (e.g. 1.0000000000000002 when N_t = 1).
+        return {a: min(1.0, (1-gamma)*scores[a]/total + gamma/n) for a in sorted(scores)}
 
-    def select(self, expansion_id):
+    def select(self, expansion_id, rho):
         if expansion_id in self.draws:
             raise ValueError('V2_DUPLICATE_SELECTION')
-        p, u = self.probabilities(), self.rng.random()
+        p, u = self.probabilities(rho), self.rng.random()
         cumulative, chosen = 0.0, next(reversed(p))
-        for c, prob in p.items():
+        for a, prob in p.items():
             cumulative += prob
             if u < cumulative:
-                chosen = c
+                chosen = a
                 break
-        row = {'lineage_id': chosen, 'probability': p[chosen],
-               'probabilities': {str(c): v for c, v in p.items()}, 'draw': u}
+        row = {'candidate_id': chosen, 'probability': p[chosen], 'probabilities': p, 'draw': u,
+               'eta': self.config.gamma / len(p), 'archive_size': len(p)}
         self.draws[expansion_id] = row
         self.selections[chosen] += 1
         return deepcopy(row)
@@ -106,33 +127,31 @@ class LineageEXP3:
                 raise ValueError('V2_REWARD_CONFLICT')
             return
         draw = self.draws[expansion_id]
-        c, p = draw['lineage_id'], draw['probability']
+        a, p, eta = draw['candidate_id'], draw['probability'], draw['eta']
         estimate = reward/p
-        updated = self.log_weights[c] + self.eta*estimate
+        updated = self.log_weights[a] + eta*estimate
         if not math.isfinite(updated):
             raise ValueError('V2_WEIGHT_OVERFLOW')
-        self.log_weights[c] = updated
-        self.feedback_counts[c] += 1
+        self.log_weights[a] = updated
+        self.feedback_counts[a] += 1
         self.rewards[expansion_id] = {'reward': reward, 'importance_weighted_reward': estimate,
-                                      'probability': p, 'eta': self.eta}
+                                      'probability': p, 'eta': eta}
 
     def state_dict(self):
-        return deepcopy({'schema_version': 1, 'founders': {str(k): v for k, v in self.founders.items()},
-            'log_weights': {str(k): v for k, v in self.log_weights.items()},
-            'probabilities': {str(k): v for k, v in self.probabilities().items()},
-            'selections': {str(k): v for k, v in self.selections.items()},
-            'feedback_counts': {str(k): v for k, v in self.feedback_counts.items()},
-            'draws': self.draws, 'rewards': self.rewards, 'eta': self.eta, 'rng': rng_snapshot(self.rng)})
+        return deepcopy({'schema_version': 2, 'agents': list(self.log_weights),
+            'log_weights': self.log_weights, 'selections': self.selections,
+            'feedback_counts': self.feedback_counts, 'draws': self.draws, 'rewards': self.rewards,
+            'rng': rng_snapshot(self.rng)})
 
     @classmethod
     def restore(cls, row, config):
-        if type(row.get('schema_version')) is not int or row['schema_version'] != 1:
+        if type(row.get('schema_version')) is not int or row['schema_version'] != 2:
             raise ValueError('V2_SELECTOR_SCHEMA')
-        result = cls(row['founders'], config, restore_rng(row['rng']))
+        result = cls(row['agents'], config, restore_rng(row['rng']))
         for field in ('log_weights', 'selections', 'feedback_counts'):
             values = row[field]
-            if set(values) != set(row['founders']):
-                raise ValueError('V2_SELECTOR_LINEAGES')
+            if set(values) != set(row['agents']) or len(set(row['agents'])) != len(row['agents']):
+                raise ValueError('V2_SELECTOR_AGENTS')
             for value in values.values():
                 if field == 'log_weights':
                     valid = type(value) in (int, float) and math.isfinite(value) and value >= 0
@@ -140,7 +159,7 @@ class LineageEXP3:
                     valid = type(value) is int and value >= 0
                 if not valid:
                     raise ValueError('V2_SELECTOR_VALUE')
-            setattr(result, field, {int(k): v for k, v in values.items()})
+            setattr(result, field, {a: values[a] for a in row['agents']})
         result.draws, result.rewards = deepcopy(row['draws']), deepcopy(row['rewards'])
         if result.state_dict() != row:
             raise ValueError('V2_SELECTOR_IDENTITY')
